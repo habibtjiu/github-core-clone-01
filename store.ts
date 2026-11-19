@@ -238,6 +238,18 @@ export class Store {
     }
   }
 
+  // Like walkTree, but keeps each entry's mode: walkTree keeps only the oid,
+  // so a mode-only change (e.g. chmod +x) is invisible to it.
+  walkTreeEntries(repo: Repo, treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>): void {
+    const tree = this.getObject(repo, treeOid);
+    if (tree === undefined || tree.type !== 'tree') return;
+    for (const entry of parseTree(tree.data)) {
+      const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.mode === '40000') this.walkTreeEntries(repo, entry.oid, path, out);
+      else out.set(path, { oid: entry.oid, mode: entry.mode });
+    }
+  }
+
   branchFiles(repo: Repo, branch: string): Map<string, string> {
     let files = repo.branchFiles.get(branch);
     if (files === undefined) {
@@ -250,15 +262,23 @@ export class Store {
   // Build the tree objects for a flat path -> blob map, creating every
   // intermediate directory tree on the way.
   buildTreeFromFiles(repo: Repo, files: Map<string, string>): string {
+    const entries = new Map<string, { oid: string; mode: string }>();
+    for (const [path, oid] of files) entries.set(path, { oid, mode: '100644' });
+    return this.buildTreeFromEntries(repo, entries);
+  }
+
+  // Like buildTreeFromFiles, but each entry carries its own mode, so an
+  // executable bit (or any other mode) survives a tree rebuild.
+  buildTreeFromEntries(repo: Repo, entries: Map<string, { oid: string; mode: string }>): string {
     const build = (prefix: string): string => {
-      const entries: TreeEntry[] = [];
-      const dirs = new Map<string, Map<string, string>>();
-      for (const [path, oid] of files) {
+      const treeEntries: TreeEntry[] = [];
+      const dirs = new Map<string, Map<string, { oid: string; mode: string }>>();
+      for (const [path, entry] of entries) {
         if (!path.startsWith(prefix)) continue;
         const rest = path.slice(prefix.length);
         const slash = rest.indexOf('/');
         if (slash === -1) {
-          entries.push({ mode: '100644', name: rest, oid });
+          treeEntries.push({ mode: entry.mode, name: rest, oid: entry.oid });
         } else {
           const dir = rest.slice(0, slash);
           let sub = dirs.get(dir);
@@ -266,15 +286,15 @@ export class Store {
             sub = new Map();
             dirs.set(dir, sub);
           }
-          sub.set(path, oid);
+          sub.set(path, entry);
         }
       }
       for (const [dir, sub] of dirs) {
         const subPrefix = prefix === '' ? `${dir}/` : `${prefix}${dir}/`;
         void sub;
-        entries.push({ mode: '40000', name: dir, oid: build(subPrefix) });
+        treeEntries.push({ mode: '40000', name: dir, oid: build(subPrefix) });
       }
-      return this.putObject(repo, 'tree', buildTree(sortTreeEntries(entries)));
+      return this.putObject(repo, 'tree', buildTree(sortTreeEntries(treeEntries)));
     };
     return build('');
   }
@@ -569,6 +589,12 @@ export class IssueOps {
 
 // --- pull requests ------------------------------------------------------------
 
+type MergeEntry = { oid: string; mode: string };
+type MergeResolution =
+  | { status: 'ok'; merged: Map<string, MergeEntry> }
+  | { status: 'conflict' }
+  | { status: 'no-base' };
+
 export class PullOps {
   private readonly store: Store;
 
@@ -664,39 +690,86 @@ export class PullOps {
     return out;
   }
 
-  // A merge conflicts when the head and the base tip both changed the same
-  // file after their common ancestor, and changed it differently.
-  mergeConflicts(repo: Repo, pr: PullRequest): boolean {
+  // One three-way resolver for conflict detection AND tree construction, so
+  // REST, GraphQL and MCP can never disagree about whether a PR merges.
+  // Content (oid) and mode are resolved as independent dimensions: a chmod
+  // on one side combines with a content edit on the other, while divergent
+  // content, divergent modes, and delete-versus-modify all conflict.
+  private resolveMerge(repo: Repo, pr: PullRequest): MergeResolution {
     const baseTip = this.store.branchTip(repo, pr.base.ref);
     const headTip = this.store.branchTip(repo, pr.head.ref);
-    if (baseTip === undefined || headTip === undefined) return true;
+    if (baseTip === undefined || headTip === undefined) return { status: 'conflict' };
     const base = this.store.mergeBase(repo, baseTip, headTip);
-    if (base === undefined) return false;
-    const baseFiles = new Map<string, string>();
+    if (base === undefined) return { status: 'no-base' };
+    const ancestor = new Map<string, MergeEntry>();
     const baseCommit = this.store.getObject(repo, base);
     if (baseCommit !== undefined && baseCommit.type === 'commit') {
-      this.store.walkTree(repo, parseCommit(baseCommit.data).tree, '', baseFiles);
+      this.store.walkTreeEntries(repo, parseCommit(baseCommit.data).tree, '', ancestor);
     }
-    const headFiles = new Map<string, string>();
+    const head = new Map<string, MergeEntry>();
     const headCommit = this.store.getObject(repo, headTip);
     if (headCommit !== undefined && headCommit.type === 'commit') {
-      this.store.walkTree(repo, parseCommit(headCommit.data).tree, '', headFiles);
+      this.store.walkTreeEntries(repo, parseCommit(headCommit.data).tree, '', head);
     }
-    const baseTipFiles = new Map<string, string>();
+    const tip = new Map<string, MergeEntry>();
     const baseTipCommit = this.store.getObject(repo, baseTip);
     if (baseTipCommit !== undefined && baseTipCommit.type === 'commit') {
-      this.store.walkTree(repo, parseCommit(baseTipCommit.data).tree, '', baseTipFiles);
+      this.store.walkTreeEntries(repo, parseCommit(baseTipCommit.data).tree, '', tip);
     }
-    const paths = new Set([...headFiles.keys(), ...baseTipFiles.keys()]);
+    const same = (x: MergeEntry | undefined, y: MergeEntry | undefined): boolean =>
+      (x === undefined && y === undefined) ||
+      (x !== undefined && y !== undefined && x.oid === y.oid && x.mode === y.mode);
+    const merged = new Map<string, MergeEntry>();
+    const paths = new Set([...ancestor.keys(), ...head.keys(), ...tip.keys()]);
     for (const path of paths) {
-      const ancestor = baseFiles.get(path);
-      const head = headFiles.get(path);
-      const tip = baseTipFiles.get(path);
-      const headChanged = head !== ancestor;
-      const tipChanged = tip !== ancestor;
-      if (headChanged && tipChanged && head !== tip) return true;
+      const a = ancestor.get(path);
+      const h = head.get(path);
+      const t = tip.get(path);
+      if (same(h, a)) {
+        if (t !== undefined) merged.set(path, t);
+      } else if (same(t, a)) {
+        if (h !== undefined) merged.set(path, h);
+      } else if (same(h, t)) {
+        if (h !== undefined) merged.set(path, h);
+      } else {
+        // Both sides changed the path differently. Combine only an
+        // independent executable-bit change on one side with a content
+        // change on the other; everything else (divergent content,
+        // divergent modes, delete-versus-modify) conflicts. A mode change
+        // that involves a symlink (120000) or any other entry type is NOT
+        // a chmod: combining it with a content edit would fabricate an
+        // entry neither side chose (e.g. a symlink pointing at regular
+        // file bytes), so it conflicts.
+        const modeOnly = (x: MergeEntry | undefined): boolean =>
+          x !== undefined && a !== undefined && x.oid === a.oid && x.mode !== a.mode;
+        const contentOnly = (x: MergeEntry | undefined): boolean =>
+          x !== undefined && a !== undefined && x.mode === a.mode && x.oid !== a.oid;
+        const regularMode = (m: string | undefined): boolean => m === '100644' || m === '100755';
+        const executableBitOnly =
+          regularMode(a?.mode) && regularMode(h?.mode) && regularMode(t?.mode);
+        if (modeOnly(h) && contentOnly(t) && executableBitOnly) merged.set(path, { oid: t.oid, mode: h.mode });
+        else if (modeOnly(t) && contentOnly(h) && executableBitOnly) merged.set(path, { oid: h.oid, mode: t.mode });
+        else return { status: 'conflict' };
+      }
     }
-    return false;
+    // A file and a directory cannot share a name in one tree: if the merged
+    // set has both `doc` and `doc/index`, the merge conflicts.
+    for (const path of merged.keys()) {
+      let prefix = '';
+      for (const part of path.split('/').slice(0, -1)) {
+        prefix = prefix === '' ? part : `${prefix}/${part}`;
+        if (merged.has(prefix)) return { status: 'conflict' };
+      }
+    }
+    return { status: 'ok', merged };
+  }
+
+  // A merge conflicts when the head and the base tip both changed the same
+  // file after their common ancestor, and changed it differently. This is
+  // the same resolver mergePr uses to build the merged tree, so the
+  // conflict answer and the merge result can never disagree.
+  mergeConflicts(repo: Repo, pr: PullRequest): boolean {
+    return this.resolveMerge(repo, pr).status === 'conflict';
   }
 
   mergePr(
@@ -706,12 +779,21 @@ export class PullOps {
     const pr = repo.prs.get(number);
     if (pr === undefined) return { ok: false, error: 'not-found' };
     if (pr.state !== 'open') return { ok: false, error: 'closed' };
-    if (this.mergeConflicts(repo, pr)) return { ok: false, error: 'conflict' };
     const headTip = this.store.branchTip(repo, pr.head.ref) as string;
     const baseTip = this.store.branchTip(repo, pr.base.ref) as string;
     const headCommit = this.store.getObject(repo, headTip);
     if (headCommit === undefined || headCommit.type !== 'commit') return { ok: false, error: 'conflict' };
-    const tree = parseCommit(headCommit.data).tree;
+    // The shared three-way resolver builds the merged tree: taking the
+    // head's whole tree would silently drop files added on the base branch
+    // after the merge-base, and resolving content and mode as separate
+    // dimensions keeps a chmod on one side from erasing a content edit on
+    // the other.
+    const resolved = this.resolveMerge(repo, pr);
+    if (resolved.status === 'conflict') return { ok: false, error: 'conflict' };
+    const tree =
+      resolved.status === 'no-base'
+        ? parseCommit(headCommit.data).tree
+        : this.store.buildTreeFromEntries(repo, resolved.merged);
     const sha = this.store.createCommit(
       repo,
       tree,
